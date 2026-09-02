@@ -23,148 +23,11 @@
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
 
-#define INF 0
-#define DBG 1
-#define ERR 2
-#define LOG_LEVEL DBG
+#include"buffer.hpp"
+#include"log.hpp"
 
-#define LOG(level, format, ...) do{\
-        if (level < LOG_LEVEL) break;\
-        time_t t = time(NULL);\
-        struct tm *ltm = localtime(&t);\
-        char tmp[32] = {0};\
-        strftime(tmp, 31, "%H:%M:%S", ltm);\
-        fprintf(stdout, "[%p %s %s:%d] " format "\n", (void*)pthread_self(), tmp, __FILE__, __LINE__, ##__VA_ARGS__);\
-    }while(0)
 
-#define INF_LOG(format, ...) LOG(INF, format, ##__VA_ARGS__)
-#define DBG_LOG(format, ...) LOG(DBG, format, ##__VA_ARGS__)
-#define ERR_LOG(format, ...) LOG(ERR, format, ##__VA_ARGS__)
 
-#define BUFFER_DEFAULT_SIZE 1024
-class Buffer {
-    private:
-        std::vector<char> _buffer; //使用vector进行内存空间管理
-        uint64_t _reader_idx; //读偏移
-        uint64_t _writer_idx; //写偏移
-    public:
-        Buffer():_reader_idx(0), _writer_idx(0), _buffer(BUFFER_DEFAULT_SIZE){}
-        char *Begin() { return &*_buffer.begin(); }
-        //获取当前写入起始地址, _buffer的空间起始地址，加上写偏移量
-        char *WritePosition() { return Begin() + _writer_idx; }
-        //获取当前读取起始地址
-        char *ReadPosition() { return Begin() + _reader_idx; }
-        //获取缓冲区末尾空闲空间大小--写偏移之后的空闲空间, 总体空间大小减去写偏移
-        uint64_t TailIdleSize() { return _buffer.size() - _writer_idx; }
-        //获取缓冲区起始空闲空间大小--读偏移之前的空闲空间
-        uint64_t HeadIdleSize() { return _reader_idx; }
-        //获取可读数据大小 = 写偏移 - 读偏移
-        uint64_t ReadAbleSize() { return _writer_idx - _reader_idx; }
-        //将读偏移向后移动
-        void MoveReadOffset(uint64_t len) { 
-            if (len == 0) return; 
-            //向后移动的大小，必须小于可读数据大小
-            assert(len <= ReadAbleSize());
-            _reader_idx += len;
-        }
-        //将写偏移向后移动 
-        void MoveWriteOffset(uint64_t len) {
-            //向后移动的大小，必须小于当前后边的空闲空间大小
-            assert(len <= TailIdleSize());
-            _writer_idx += len;
-        }
-        //确保可写空间足够（整体空闲空间够了就移动数据，否则就扩容）
-        void EnsureWriteSpace(uint64_t len) {
-            //如果末尾空闲空间大小足够，直接返回
-            if (TailIdleSize() >= len) { return; }
-            //末尾空闲空间不够，则判断加上起始位置的空闲空间大小是否足够, 够了就将数据移动到起始位置
-            if (len <= TailIdleSize() + HeadIdleSize()) {
-                //将数据移动到起始位置
-                uint64_t rsz = ReadAbleSize();//把当前数据大小先保存起来
-                std::copy(ReadPosition(), ReadPosition() + rsz, Begin());//把可读数据拷贝到起始位置
-                _reader_idx = 0;    //将读偏移归0
-                _writer_idx = rsz;  //将写位置置为可读数据大小， 因为当前的可读数据大小就是写偏移量
-            }else {
-                //总体空间不够，则需要扩容，不移动数据，直接给写偏移之后扩容足够空间即可
-                DBG_LOG("RESIZE %ld", _writer_idx + len);
-                _buffer.resize(_writer_idx + len);
-            }
-        } 
-        //写入数据
-        void Write(const void *data, uint64_t len) {
-            //1. 保证有足够空间，2. 拷贝数据进去
-            if (len == 0) return;
-            EnsureWriteSpace(len);
-            const char *d = (const char *)data;
-            std::copy(d, d + len, WritePosition());
-        }
-        void WriteAndPush(const void *data, uint64_t len) {
-            Write(data, len);
-            MoveWriteOffset(len);
-        }
-        void WriteString(const std::string &data) {
-            return Write(data.c_str(), data.size());
-        }
-        void WriteStringAndPush(const std::string &data) {
-            WriteString(data);
-            MoveWriteOffset(data.size());
-        }
-        void WriteBuffer(Buffer &data) {
-            return Write(data.ReadPosition(), data.ReadAbleSize());
-        }
-        void WriteBufferAndPush(Buffer &data) { 
-            WriteBuffer(data);
-            MoveWriteOffset(data.ReadAbleSize());
-        }
-        //读取数据
-        void Read(void *buf, uint64_t len) {
-            //要求要获取的数据大小必须小于可读数据大小
-            assert(len <= ReadAbleSize());
-            std::copy(ReadPosition(), ReadPosition() + len, (char*)buf);
-        }
-        void ReadAndPop(void *buf, uint64_t len) {
-            Read(buf, len);
-            MoveReadOffset(len);
-        }
-        std::string ReadAsString(uint64_t len) {
-            //要求要获取的数据大小必须小于可读数据大小
-            assert(len <= ReadAbleSize());
-            std::string str;
-            str.resize(len);
-            Read(&str[0], len);
-            return str;
-        }
-        std::string ReadAsStringAndPop(uint64_t len) {
-            assert(len <= ReadAbleSize());
-            std::string str = ReadAsString(len);
-            MoveReadOffset(len);
-            return str;
-        }
-        char *FindCRLF() {
-            char *res = (char*)memchr(ReadPosition(), '\n', ReadAbleSize());
-            return res;
-        }
-        /*通常获取一行数据，这种情况针对是*/
-        std::string GetLine() {
-            char *pos = FindCRLF();
-            if (pos == NULL) {
-                return "";
-            }
-            // +1是为了把换行字符也取出来。
-            return ReadAsString(pos - ReadPosition() + 1);
-        }
-        std::string GetLineAndPop() {
-            std::string str = GetLine();
-            MoveReadOffset(str.size());
-            return str;
-        }
-        //清空缓冲区
-        void Clear() {
-            //只需要将偏移量归0即可
-            _reader_idx = 0;
-            _writer_idx = 0;
-        }
-};
 
 #define MAX_LISTEN 1024
 class Socket {
@@ -237,7 +100,6 @@ class Socket {
         }
         //接收数据
         ssize_t Recv(void *buf, size_t len, int flag = 0) {
-            // ssize_t recv(int sockfd, void *buf, size_t len, int flag);
             ssize_t ret = recv(_sockfd, buf, len, flag);
             if (ret <= 0) {
                 //EAGAIN 当前socket的接收缓冲区中没有数据了，在非阻塞的情况下才会有这个错误
@@ -255,7 +117,7 @@ class Socket {
         }
         //发送数据
         ssize_t Send(const void *buf, size_t len, int flag = 0) {
-            // ssize_t send(int sockfd, void *data, size_t len, int flag);
+
             ssize_t ret = send(_sockfd, buf, len, flag);
             if (ret < 0) {
                 if (errno == EAGAIN || errno == EINTR) {
@@ -277,9 +139,9 @@ class Socket {
                 _sockfd = -1;
             }
         }
-        //创建一个服务端连接
+       
         bool CreateServer(uint16_t port, const std::string &ip = "0.0.0.0", bool block_flag = false) {
-            //1. 创建套接字，2. 绑定地址，3. 开始监听，4. 设置非阻塞， 5. 启动地址重用
+    
             if (Create() == false) return false;
             if (block_flag) NonBlock();
             if (Bind(ip, port) == false) return false;
@@ -287,16 +149,14 @@ class Socket {
             ReuseAddress();
             return true;
         }
-        //创建一个客户端连接
-        bool CreateClient(uint16_t port, const std::string &ip) {
-            //1. 创建套接字，2.指向连接服务器
+        
+        bool CreateClient(uint16_t port, const std::string &ip) {         
             if (Create() == false) return false;
             if (Connect(ip, port) == false) return false;
             return true;
         }
         //设置套接字选项---开启地址端口重用
-        void ReuseAddress() {
-            // int setsockopt(int fd, int leve, int optname, void *val, int vallen)
+        void ReuseAddress() {         
             int val = 1;
             setsockopt(_sockfd, SOL_SOCKET, SO_REUSEADDR, (void*)&val, sizeof(int));
             val = 1;
@@ -304,7 +164,6 @@ class Socket {
         }
         //设置套接字阻塞属性-- 设置为非阻塞
         void NonBlock() {
-            //int fcntl(int fd, int cmd, ... /* arg */ );
             int flag = fcntl(_sockfd, F_GETFL, 0);
             fcntl(_sockfd, F_SETFL, flag | O_NONBLOCK);
         }
@@ -316,14 +175,14 @@ class Channel {
     private:
         int _fd;
         EventLoop *_loop;
-        uint32_t _events;  // 当前需要监控的事件
-        uint32_t _revents; // 当前连接触发的事件
+        uint32_t _events; 
+        uint32_t _revents; 
         using EventCallback = std::function<void()>;
-        EventCallback _read_callback;   //可读事件被触发的回调函数
-        EventCallback _write_callback;  //可写事件被触发的回调函数
-        EventCallback _error_callback;  //错误事件被触发的回调函数
-        EventCallback _close_callback;  //连接断开事件被触发的回调函数
-        EventCallback _event_callback;  //任意事件被触发的回调函数
+        EventCallback _read_callback;   
+        EventCallback _write_callback;  
+        EventCallback _error_callback;  
+        EventCallback _close_callback;  
+        EventCallback _event_callback;  
     public:
         Channel(EventLoop *loop, int fd):_fd(fd), _events(0), _revents(0), _loop(loop) {}
         int Fd() { return _fd; }
@@ -351,7 +210,7 @@ class Channel {
         //移除监控
         void Remove();
         void Update();
-        //事件处理，一旦连接触发了事件，就调用这个函数，自己触发了什么事件如何处理自己决定
+        
         void HandleEvent() {
             if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI)) {
                 /*不管任何事件，都调用的回调函数*/
@@ -361,7 +220,7 @@ class Channel {
             if (_revents & EPOLLOUT) {
                 if (_write_callback) _write_callback();
             }else if (_revents & EPOLLERR) {
-                if (_error_callback) _error_callback();//一旦出错，就会释放连接，因此要放到前边调用任意回调
+                if (_error_callback) _error_callback();
             }else if (_revents & EPOLLHUP) {
                 if (_close_callback) _close_callback();
             }
@@ -535,7 +394,7 @@ class TimerWheel {
             if (it == _timers.end()) {
                 return;//没找着定时任务，没法刷新，没法延迟
             }
-            PtrTask pt = it->second.lock();//lock获取weak_ptr管理的对象对应的shared_ptr
+            PtrTask pt = it->second.lock();
             int delay = pt->DelayTime();
             int pos = (_tick + delay) % _capacity;
             _wheel[pos].push_back(pt);
@@ -554,13 +413,9 @@ class TimerWheel {
             _timer_channel->SetReadCallback(std::bind(&TimerWheel::OnTime, this));
             _timer_channel->EnableRead();//启动读事件监控
         }
-        /*定时器中有个_timers成员，定时器信息的操作有可能在多线程中进行，因此需要考虑线程安全问题*/
-        /*如果不想加锁，那就把对定期的所有操作，都放到一个线程中进行*/
         void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb);
-        //刷新/延迟定时任务
         void TimerRefresh(uint64_t id);
         void TimerCancel(uint64_t id);
-        /*这个接口存在线程安全问题--这个接口实际上不能被外界使用者调用，只能在模块内，在对应的EventLoop线程内执行*/
         bool HasTimer(uint64_t id) {
             auto it = _timers.find(id);
             if (it == _timers.end()) {
@@ -900,20 +755,20 @@ class Connection : public std::enable_shared_from_this<Connection> {
         }
         //这个接口才是实际的释放接口
         void ReleaseInLoop() {
-            //1. 修改连接状态，将其置为DISCONNECTED
+
             _statu = DISCONNECTED;
-            //2. 移除连接的事件监控
+       
             _channel.Remove();
-            //3. 关闭描述符
+      
             _socket.Close();
-            //4. 如果当前定时器队列中还有定时销毁任务，则取消任务
+        
             if (_loop->HasTimer(_conn_id)) CancelInactiveReleaseInLoop();
-            //5. 调用关闭回调函数，避免先移除服务器管理的连接信息导致Connection被释放，再去处理会出错，因此先调用用户的回调函数
+           
             if (_closed_callback) _closed_callback(shared_from_this());
-            //移除服务器内部管理的连接信息
+  
             if (_server_closed_callback) _server_closed_callback(shared_from_this());
         }
-        //这个接口并不是实际的发送接口，而只是把数据放到了发送缓冲区，启动了可写事件监控
+      
         void SendInLoop(Buffer &buf) {
             if (_statu == DISCONNECTED) return ;
             _out_buffer.WriteBufferAndPush(buf);
@@ -991,14 +846,13 @@ class Connection : public std::enable_shared_from_this<Connection> {
         void SetClosedCallback(const ClosedCallback&cb) { _closed_callback = cb; }
         void SetAnyEventCallback(const AnyEventCallback&cb) { _event_callback = cb; }
         void SetSrvClosedCallback(const ClosedCallback&cb) { _server_closed_callback = cb; }
-        //连接建立就绪后，进行channel回调设置，启动读监控，调用_connected_callback
+
         void Established() {
             _loop->RunInLoop(std::bind(&Connection::EstablishedInLoop, this));
         }
         //发送数据，将数据放到发送缓冲区，启动写事件监控
         void Send(const char *data, size_t len) {
-            //外界传入的data，可能是个临时的空间，我们现在只是把发送操作压入了任务池，有可能并没有被立即执行
-            //因此有可能执行的时候，data指向的空间有可能已经被释放了。
+
             Buffer buf;
             buf.WriteAndPush(data, len);
             _loop->RunInLoop(std::bind(&Connection::SendInLoop, this, std::move(buf)));
@@ -1062,14 +916,14 @@ class Acceptor {
 
 class TcpServer {
     private:
-        uint64_t _next_id;      //这是一个自动增长的连接ID，
+        uint64_t _next_id;      
         int _port;
-        int _timeout;           //这是非活跃连接的统计时间---多长时间无通信就是非活跃连接
-        bool _enable_inactive_release;//是否启动了非活跃连接超时销毁的判断标志
-        EventLoop _baseloop;    //这是主线程的EventLoop对象，负责监听事件的处理
-        Acceptor _acceptor;    //这是监听套接字的管理对象
-        LoopThreadPool _pool;   //这是从属EventLoop线程池
-        std::unordered_map<uint64_t, PtrConnection> _conns;//保存管理所有连接对应的shared_ptr对象
+        int _timeout;           
+        bool _enable_inactive_release;
+        EventLoop _baseloop;    
+        Acceptor _acceptor;   
+        LoopThreadPool _pool;  
+        std::unordered_map<uint64_t, PtrConnection> _conns;
 
         using ConnectedCallback = std::function<void(const PtrConnection&)>;
         using MessageCallback = std::function<void(const PtrConnection&, Buffer *)>;
@@ -1138,7 +992,7 @@ void Channel::Update() { return _loop->UpdateEvent(this); }
 void TimerWheel::TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerAddInLoop, this, id, delay, cb));
 }
-//刷新/延迟定时任务
+
 void TimerWheel::TimerRefresh(uint64_t id) {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerRefreshInLoop, this, id));
 }
